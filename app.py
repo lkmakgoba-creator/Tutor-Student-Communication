@@ -1,14 +1,22 @@
+import os
 import streamlit as st
 import pandas as pd
 import hashlib
-import gspread
-from google.oauth2.service_account import Credentials
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
 
 # ==================== CONFIG ====================
 TUT_COLS = ["Tut 1", "Tut 2", "Tut 3", "Tut 4", "Tut 5"]
-REQUIRED_COLS = ["Student_Number", "Surname", "Name"] + TUT_COLS + \
-    ["Overall", "question", "response", "Password"]
+REQUIRED_COLS = ["Student_Number", "Surname", "Name"] + TUT_COLS + ["Overall", "question", "response", "Password"]
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+LOCAL_CSV = os.path.join(os.path.dirname(__file__), "TutorialGroup.csv")
+SHEET_ID = "15MGolGLXmdQzAr8MCv4SgYTUVPpjnZSXZ6Nbu6XG8tk"
+SHEET_EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid=0"
 
 
 def hash_password(raw_password: str) -> str:
@@ -18,44 +26,39 @@ def hash_password(raw_password: str) -> str:
 
 @st.cache_resource(show_spinner=False)
 def get_worksheet():
-    """
-    Connect once per running app to the Google Sheet that stores the roster.
-    Requires two entries in st.secrets (see SETUP.md):
-      - st.secrets["gcp_service_account"]  -> the service account JSON as a dict
-      - st.secrets["sheet_id"]             -> the ID of the Google Sheet
-    """
+    """Connect to Google Sheets using Streamlit secrets when available."""
     try:
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=SCOPES
-        )
+        if gspread is None or Credentials is None:
+            raise RuntimeError("Google Sheets libraries are not available")
+
+        if not hasattr(st, "secrets") or "gcp_service_account" not in st.secrets:
+            raise KeyError("Missing Google Sheets service-account secrets")
+
+        service_account = st.secrets["gcp_service_account"]
+        creds = Credentials.from_service_account_info(service_account, scopes=SCOPES)
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(st.secrets["sheet_id"]).sheet1
-        return sheet
-    except Exception as e:
-        st.error(
-            "Could not connect to the Google Sheet. Double-check that:\n"
-            "1) `gcp_service_account` and `sheet_id` are set in your app secrets\n"
-            "2) The Sheet has been shared (as Editor) with the service account's email\n\n"
-            f"Technical details: {e}"
-        )
-        st.stop()
+        sheet_id = st.secrets.get("sheet_id", SHEET_ID)
+        return client.open_by_key(sheet_id).sheet1
+    except Exception:
+        return None
 
 
 def load_data() -> pd.DataFrame:
-    """Pull the latest roster from the Google Sheet into a clean DataFrame."""
+    """Pull the latest roster from Google Sheets via secrets, then fall back to the CSV export or local CSV file."""
     sheet = get_worksheet()
-    records = sheet.get_all_records()
-    df = pd.DataFrame(records)
+
+    if sheet is None:
+        try:
+            df = pd.read_csv(SHEET_EXPORT_URL)
+        except Exception:
+            df = pd.read_csv(LOCAL_CSV)
+    else:
+        df = pd.DataFrame(sheet.get_all_records())
 
     if df.empty:
-        st.error(
-            "The Google Sheet appears to be empty. Make sure row 1 has your "
-            "column headers (Student_Number, Surname, Name, Tut 1 ... Tut 5, Overall) "
-            "and the student rows are filled in below it."
-        )
+        st.error("The roster appears to be empty. Make sure row 1 has your column headers and the student rows are filled in below it.")
         st.stop()
 
-    # Clean headers and whitespace inside every text cell
     df.columns = df.columns.str.strip()
     for col in df.columns:
         if df[col].dtype == object:
@@ -63,12 +66,10 @@ def load_data() -> pd.DataFrame:
 
     df["Student_Number"] = df["Student_Number"].astype(str).str.strip()
 
-    # Always guarantee the columns the app depends on exist
     for col in REQUIRED_COLS:
         if col not in df.columns:
             df[col] = ""
 
-    # Marks should be numeric, blanks -> 0
     for col in TUT_COLS + ["Overall"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
@@ -76,9 +77,14 @@ def load_data() -> pd.DataFrame:
 
 
 def save_data():
-    """Push the in-memory roster back to the Google Sheet."""
+    """Push the in-memory roster back to Google Sheets via secrets, or save locally when unavailable."""
     sheet = get_worksheet()
     df = st.session_state.db.fillna("")
+
+    if sheet is None:
+        df.to_csv(LOCAL_CSV, index=False)
+        return
+
     values = [df.columns.tolist()] + df.astype(str).values.tolist()
     sheet.clear()
     sheet.update(values=values)
@@ -117,18 +123,14 @@ st.markdown(
 if "db" not in st.session_state:
     st.session_state.db = load_data()
 
-# Manual refresh so the tutor (or a student) can pull the latest data
-# without restarting the whole app.
 with st.sidebar:
     if st.button("🔄 Refresh Data"):
         st.session_state.db = load_data()
         st.success("Data refreshed from Google Sheet.")
         st.rerun()
 
-# ==================== ROLE SELECTION ====================
 role = st.sidebar.radio("Select Role:", ["Student Portal", "Tutor Dashboard"])
 
-# ==================== STUDENT INTERFACE ====================
 if role == "Student Portal":
     st.header("👤 Student Authentication")
 
@@ -145,7 +147,6 @@ if role == "Student Portal":
 
     if submit_auth:
         df = st.session_state.db
-
         input_fn = input_fn.strip()
         input_sn = input_sn.strip()
         input_id = input_id.strip()
@@ -158,14 +159,13 @@ if role == "Student Portal":
 
         if not match.empty:
             st.session_state.auth_index = int(match.index[0])
-            st.session_state.password_ok = False  # always require the password step next
+            st.session_state.password_ok = False
             st.success(f"Identity confirmed, {input_fn}! Now enter your password below.")
         else:
             st.session_state.auth_index = None
             st.session_state.password_ok = False
             st.error("Authentication failed. Please verify the exact spelling from your spreadsheet.")
 
-    # ---- Password step: runs once identity is confirmed, before the dashboard ----
     if st.session_state.auth_index is not None and not st.session_state.password_ok:
         idx = st.session_state.auth_index
         df = st.session_state.db
@@ -203,7 +203,6 @@ if role == "Student Portal":
                 else:
                     st.error("Incorrect password. Please try again.")
 
-    # Show dashboard only once identity AND password are both verified
     if st.session_state.auth_index is not None and st.session_state.password_ok:
         idx = st.session_state.auth_index
         df = st.session_state.db
@@ -237,7 +236,6 @@ if role == "Student Portal":
         if student_data['response']:
             st.info(f"**Tutor Response:** {student_data['response']}")
 
-# ==================== TUTOR INTERFACE ====================
 elif role == "Tutor Dashboard":
     st.header("👨‍🏫 Tutor Administration Dashboard")
     password = st.text_input("Enter Tutor Password", type="password")
